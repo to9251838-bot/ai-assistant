@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#070812" />
+  <title>AI Orb</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+
+  <header class="topbar">
+    <div class="brand"><span class="brand-dot"></span> AI Orb</div>
+    <div class="top-actions">
+      <select id="language" aria-label="Language">
+        <option value="ru">Русский</option>
+        <option value="en">English</option>
+      </select>
+      <button id="authButton" class="ghost-btn">Войти</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="orb-stage">
+      <div class="orb-wrap" id="orbWrap">
+        <div class="gas gas-1"></div>
+        <div class="gas gas-2"></div>
+        <div class="gas gas-3"></div>
+        <div class="orb-glow"></div>
+        <button id="orb" class="orb" aria-label="Нажмите для записи">
+          <span class="orb-core"></span>
+          <span class="orb-sheen"></span>
+        </button>
+      </div>
+      <div id="status" class="status">Нажмите на шар и говорите</div>
+      <div class="hint">Нажмите ещё раз, чтобы отправить раньше тишины</div>
+    </section>
+
+    <section class="chat-panel">
+      <div class="chat-head">
+        <div>
+          <div class="eyebrow">CONVERSATION</div>
+          <h1>Ваш помощник</h1>
+        </div>
+        <button id="newChat" class="icon-btn" title="Новый разговор">＋</button>
+      </div>
+      <div id="messages" class="messages">
+        <div class="welcome">
+          <div class="welcome-orb"></div>
+          <h2>Готов слушать</h2>
+          <p>Говорите по-русски или English. Попросите ответить, создать изображение или показать погоду.</p>
+        </div>
+      </div>
+      <form id="textForm" class="composer">
+        <input id="textInput" autocomplete="off" placeholder="Или напишите сообщение…" />
+        <button type="submit" class="send-btn">↑</button>
+      </form>
+    </section>
+  </main>
+
+  <div id="authModal" class="modal hidden">
+    <div class="modal-card">
+      <button id="closeAuth" class="modal-close">×</button>
+      <div class="eyebrow">ACCOUNT</div>
+      <h2 id="authTitle">Войти</h2>
+      <p id="authSubtitle">Чтобы сохранять разговоры в MongoDB.</p>
+      <form id="authForm">
+        <input id="email" type="email" placeholder="Email" required />
+        <input id="password" type="password" placeholder="Пароль (8+ символов)" minlength="8" required />
+        <button class="primary-btn" type="submit" id="authSubmit">Войти</button>
+      </form>
+      <button id="toggleAuth" class="link-btn">Нет аккаунта? Зарегистрироваться</button>
+      <div id="authError" class="error"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
