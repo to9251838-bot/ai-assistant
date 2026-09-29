@@ -634,6 +634,72 @@ authForm.addEventListener("submit",async e=>{
 
 updateAuthUI();
 loadSavedLocations();
+
+async function loadSavedLocations() {
+    const container = document.getElementById("savedLocations");
+    if (!container) return;
+
+    const token = localStorage.getItem("token");
+
+    if (!token) {
+        container.innerHTML = "";
+        return;
+    }
+
+    try {
+        const response = await fetch("/api/weather/saved", {
+            headers: {
+                "Authorization": `Bearer ${token}`
+            }
+        });
+
+        if (!response.ok) {
+            container.innerHTML = "";
+            return;
+        }
+
+        const locations = await response.json();
+
+        if (!Array.isArray(locations) || locations.length === 0) {
+            container.innerHTML = "";
+            return;
+        }
+
+        container.innerHTML = locations.map(location => `
+            <button
+                class="saved-location"
+                data-lat="${location.lat}"
+                data-lon="${location.lon}"
+            >
+                <span>${escapeHtml(location.name || "Saved location")}</span>
+                <small>${escapeHtml(location.country || "")}</small>
+            </button>
+        `).join("");
+
+        container.querySelectorAll(".saved-location").forEach(button => {
+            button.addEventListener("click", async () => {
+                const lat = Number(button.dataset.lat);
+                const lon = Number(button.dataset.lon);
+
+                await loadWeatherByCoordinates(lat, lon);
+            });
+        });
+
+    } catch (error) {
+        console.error("Failed to load saved locations:", error);
+        container.innerHTML = "";
+    }
+}
+
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
   </script>
 </body>
 </html>
