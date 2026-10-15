@@ -1,1006 +1,363 @@
 import os
-import io
+import time
 import json
-import base64
-import secrets
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
-from functools import wraps
+import re
+from pathlib import Path
+from typing import Optional
 
-import bcrypt
-import jwt
-import requests
-from flask import Flask, request, jsonify, send_from_directory
-from pymongo import MongoClient, ASCENDING
-from groq import Groq
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_TITLE = "World Explorer"
+BASE_DIR = Path(__file__).resolve().parent
 
-app = Flask(__name__, static_folder=None)
+# Existing World Explorer keys/routes are preserved.
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_IMAGE_MODEL = os.getenv(
+    "CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell"
+).strip()
 
-# -----------------------------
-# Configuration
-# -----------------------------
-MONGODB_URI = os.getenv("MONGODB_URI", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
+# Dedicated keys for /travel-messanger.
+TRAVEL_GROQ_API_KEY = os.getenv("TRAVEL_GROQ_API_KEY", "").strip()
+TRAVEL_CLOUDFLARE_ACCOUNT_ID = os.getenv("TRAVEL_CLOUDFLARE_ACCOUNT_ID", "").strip()
+TRAVEL_CLOUDFLARE_API_TOKEN = os.getenv("TRAVEL_CLOUDFLARE_API_TOKEN", "").strip()
+TRAVEL_OPENWEATHER_API_KEY = os.getenv("TRAVEL_OPENWEATHER_API_KEY", "").strip()
+TRAVEL_CLOUDFLARE_IMAGE_MODEL = os.getenv(
+    "TRAVEL_CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell"
+).strip()
+TRAVEL_GROQ_MODEL = os.getenv("TRAVEL_GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
-# Non-secret settings stay in code.
-JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_hex(32)
-GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
-GROQ_STT_MODEL = "whisper-large-v3"
-GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
-GROQ_TTS_VOICE = "hannah"
-CLOUDFLARE_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+app = FastAPI(title=APP_TITLE)
+_sky_cache: dict[str, tuple[float, dict]] = {}
+_travel_sky_cache: dict[str, tuple[float, dict]] = {}
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-mongo_client = None
-db = None
-users = None
-conversations = None
+class SkyRequest(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    weather: str = Field(default="clear sky", max_length=160)
+    period: str = Field(default="day", max_length=20)
 
-if MONGODB_URI:
+
+class TravelChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[dict] = Field(default_factory=list, max_length=16)
+
+
+class TravelSkyRequest(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    weather: str = Field(default="clear sky", max_length=160)
+    period: str = Field(default="day", max_length=20)
+    local_time: str = Field(default="unknown", max_length=80)
+    place_name: str = Field(default="unknown place", max_length=160)
+
+
+def read_html(filename: str) -> str:
+    path = BASE_DIR / filename
     try:
-        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        mongo_client.admin.command("ping")
-        db_name = mongo_client.get_default_database()
-        if db_name is None:
-            db_name = mongo_client["ai_orb"]
-        db = db_name
-        users = db["users"]
-        conversations = db["conversations"]
-        users.create_index([("email", ASCENDING)], unique=True)
-        conversations.create_index([("user_id", ASCENDING), ("updated_at", -1)])
-        print("MongoDB connected.")
-    except Exception as exc:
-        print(f"MongoDB connection failed: {exc}")
-        mongo_client = db = users = conversations = None
-else:
-    print("MONGODB_URI is not set. Authentication/history will be unavailable.")
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise HTTPException(500, f"{filename} is missing from the repository root")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def now():
-    return datetime.now(timezone.utc)
 
-def token_for_user(user_id):
-    payload = {
-        "sub": str(user_id),
-        "exp": now() + timedelta(days=30),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+def _period_from_weather(data: dict) -> str:
+    now = int(time.time()) + int(data.get("timezone", 0) or 0)
+    local_hour = time.gmtime(now).tm_hour
+    if local_hour < 5 or local_hour >= 21:
+        return "night"
+    if local_hour < 7:
+        return "dawn"
+    if local_hour >= 18:
+        return "dusk"
+    return "day"
 
-def current_user_id():
-    header = request.headers.get("Authorization", "")
-    if not header.startswith("Bearer "):
+
+def _parse_coordinates(text: str) -> Optional[tuple[float, float]]:
+    match = re.search(
+        r"(?<![\d.])(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)(?![\d.])",
+        text.strip(),
+    )
+    if not match:
         return None
-    token = header[7:].strip()
+    lat, lon = float(match.group(1)), float(match.group(2))
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
+
+
+async def _get_weather(lat: float, lon: float, api_key: str) -> dict:
+    if not api_key:
+        raise HTTPException(503, "Не настроен OpenWeather API key для этого раздела")
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload["sub"]
-    except Exception:
-        return None
-
-def auth_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        uid = current_user_id()
-        if not uid:
-            return jsonify({"error": "Требуется авторизация"}), 401
-        return fn(uid, *args, **kwargs)
-    return wrapper
-
-def clean_doc(doc):
-    if not doc:
-        return None
-    doc = dict(doc)
-    if "_id" in doc:
-        doc["_id"] = str(doc["_id"])
-    return doc
-
-def require_service_config():
-    missing = []
-    if not GROQ_API_KEY:
-        missing.append("GROQ_API_KEY")
-    if missing:
-        raise RuntimeError("Не настроен: " + ", ".join(missing))
-
-def route_request(text):
-    """Ask Groq to classify a request and return strict JSON."""
-    require_service_config()
-    prompt = f"""
-Ты — маршрутизатор русско- и англоязычного AI-ассистента.
-Определи намерение пользователя.
-
-Верни ТОЛЬКО JSON без markdown:
-{{
-  "intent": "chat" | "weather" | "image",
-  "language": "ru" | "en",
-  "reply": "короткий естественный ответ, если intent=chat",
-  "city": "город или пустая строка, если weather",
-  "image_prompt": "подробное описание изображения НА АНГЛИЙСКОМ, если image"
-}}
-
-Правила:
-- Погода, температура, прогноз/состояние погоды -> weather.
-- Просьба нарисовать, создать, сгенерировать изображение -> image.
-- Всё остальное -> chat.
-- Для image обязательно переведи и уточни описание на английском.
-- Для weather извлеки название города.
-- Не придумывай город, если его нет.
-
-Текст пользователя:
-{text}
-"""
-    response = groq_client.chat.completions.create(
-        model=GROQ_CHAT_MODEL,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "Ты точный JSON router."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    raw = response.choices[0].message.content
-    return json.loads(raw)
-
-def chat_response(text):
-    response = groq_client.chat.completions.create(
-        model=GROQ_CHAT_MODEL,
-        temperature=0.7,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты полезный голосовой AI-ассистент. Отвечай естественно и "
-                    "кратко, если вопрос простой. Отвечай на языке пользователя."
-                ),
-            },
-            {"role": "user", "content": text},
-        ],
-    )
-    return response.choices[0].message.content.strip()
-
-def weather_response(city):
-    if not OPENWEATHER_API_KEY:
-        raise RuntimeError("Не настроен OPENWEATHER_API_KEY")
-
-    geo = requests.get(
-        "https://api.openweathermap.org/geo/1.0/direct",
-        params={"q": city, "limit": 1, "appid": OPENWEATHER_API_KEY},
-        timeout=12,
-    )
-    geo.raise_for_status()
-    locations = geo.json()
-    if not locations:
-        return {"text": f"Я не нашёл город «{city}».", "data": None}
-
-    loc = locations[0]
-    weather = requests.get(
-        "https://api.openweathermap.org/data/2.5/weather",
-        params={
-            "lat": loc["lat"],
-            "lon": loc["lon"],
-            "appid": OPENWEATHER_API_KEY,
-            "units": "metric",
-            "lang": "ru",
-        },
-        timeout=12,
-    )
-    weather.raise_for_status()
-    data = weather.json()
-
-    temp = round(data["main"]["temp"])
-    feels = round(data["main"]["feels_like"])
-    description = data["weather"][0]["description"]
-    humidity = data["main"]["humidity"]
-
-    text = (
-        f"Сейчас в {loc.get('name', city)}: {temp}°C, {description}. "
-        f"Ощущается как {feels}°C, влажность {humidity}%."
-    )
-    return {
-        "text": text,
-        "data": {
-            "city": loc.get("name", city),
-            "country": loc.get("country", ""),
-            "temperature": temp,
-            "feels_like": feels,
-            "description": description,
-            "humidity": humidity,
-        },
-    }
-
-
-def geocode_locations(query, limit=5):
-    if not OPENWEATHER_API_KEY:
-        raise RuntimeError("Не настроен OPENWEATHER_API_KEY")
-    q = (query or "").strip()
-    if not q:
-        return []
-    response = requests.get(
-        "https://api.openweathermap.org/geo/1.0/direct",
-        params={"q": q, "limit": min(max(int(limit), 1), 5), "appid": OPENWEATHER_API_KEY},
-        timeout=12,
-    )
-    response.raise_for_status()
-    return response.json()
-
-def reverse_geocode(lat, lon, limit=5):
-    if not OPENWEATHER_API_KEY:
-        raise RuntimeError("Не настроен OPENWEATHER_API_KEY")
-    response = requests.get(
-        "https://api.openweathermap.org/geo/1.0/reverse",
-        params={"lat": lat, "lon": lon, "limit": min(max(int(limit), 1), 5), "appid": OPENWEATHER_API_KEY},
-        timeout=12,
-    )
-    response.raise_for_status()
-    return response.json()
-
-def location_label(loc):
-    parts = [loc.get("name", "")]
-    state = loc.get("state")
-    country = loc.get("country")
-    if state:
-        parts.append(state)
-    if country:
-        parts.append(country)
-    return ", ".join([p for p in parts if p])
-
-def weather_bundle(lat, lon, lang="ru"):
-    if not OPENWEATHER_API_KEY:
-        raise RuntimeError("Не настроен OPENWEATHER_API_KEY")
-
-    current_response = requests.get(
-        "https://api.openweathermap.org/data/2.5/weather",
-        params={
-            "lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY,
-            "units": "metric", "lang": lang if lang in {"ru", "en"} else "ru",
-        },
-        timeout=12,
-    )
-    current_response.raise_for_status()
-    current = current_response.json()
-
-    forecast_response = requests.get(
-        "https://api.openweathermap.org/data/2.5/forecast",
-        params={
-            "lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY,
-            "units": "metric", "lang": lang if lang in {"ru", "en"} else "ru",
-        },
-        timeout=12,
-    )
-    forecast_response.raise_for_status()
-    forecast = forecast_response.json()
-
-    city = current.get("name") or "Точка"
-    country = current.get("sys", {}).get("country", "")
-    timezone_offset = current.get("timezone", 0)
-    now_local = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + timezone_offset, tz=timezone.utc)
-    sunrise = current.get("sys", {}).get("sunrise")
-    sunset = current.get("sys", {}).get("sunset")
-    now_utc_ts = datetime.now(timezone.utc).timestamp()
-    is_day = bool(sunrise and sunset and sunrise <= now_utc_ts <= sunset)
-
-    daily = {}
-    for item in forecast.get("list", []):
-        dt = item.get("dt", 0) + timezone_offset
-        day = datetime.fromtimestamp(dt, tz=timezone.utc).date().isoformat()
-        entry = {
-            "dt": item.get("dt"),
-            "time": datetime.fromtimestamp(dt, tz=timezone.utc).strftime("%H:%M"),
-            "temp": round(item.get("main", {}).get("temp", 0)),
-            "feels_like": round(item.get("main", {}).get("feels_like", 0)),
-            "description": item.get("weather", [{}])[0].get("description", ""),
-            "main": item.get("weather", [{}])[0].get("main", "Clear"),
-            "icon": item.get("weather", [{}])[0].get("icon", "01d"),
-            "humidity": item.get("main", {}).get("humidity", 0),
-            "wind": item.get("wind", {}).get("speed", 0),
-            "pop": round((item.get("pop", 0) or 0) * 100),
-        }
-        daily.setdefault(day, []).append(entry)
-
-    days = []
-    for day, items in list(daily.items())[:5]:
-        temps = [x["temp"] for x in items]
-        midday = min(items, key=lambda x: abs(int(x["time"].split(":")[0]) - 13))
-        days.append({
-            "date": day,
-            "min": min(temps),
-            "max": max(temps),
-            "description": midday["description"],
-            "main": midday["main"],
-            "icon": midday["icon"],
-            "pop": max(x["pop"] for x in items),
-            "humidity": round(sum(x["humidity"] for x in items) / len(items)),
-        })
-
-    return {
-        "location": {
-            "name": city,
-            "country": country,
-            "label": ", ".join([x for x in [city, country] if x]),
-            "lat": float(current.get("coord", {}).get("lat", lat)),
-            "lon": float(current.get("coord", {}).get("lon", lon)),
-        },
-        "current": {
-            "temp": round(current.get("main", {}).get("temp", 0)),
-            "feels_like": round(current.get("main", {}).get("feels_like", 0)),
-            "description": current.get("weather", [{}])[0].get("description", ""),
-            "main": current.get("weather", [{}])[0].get("main", "Clear"),
-            "icon": current.get("weather", [{}])[0].get("icon", "01d"),
-            "humidity": current.get("main", {}).get("humidity", 0),
-            "pressure": current.get("main", {}).get("pressure", 0),
-            "wind": round(current.get("wind", {}).get("speed", 0), 1),
-            "visibility": round((current.get("visibility", 0) or 0) / 1000, 1),
-            "sunrise": sunrise,
-            "sunset": sunset,
-            "is_day": is_day,
-        },
-        "timezone_offset": timezone_offset,
-        "local_time": now_local.strftime("%H:%M"),
-        "forecast": days,
-        "updated_at": now().isoformat(),
-    }
-
-def parse_weather_location_query(text):
-    require_service_config()
-    prompt = f"""
-Определи местоположение из запроса пользователя для приложения погоды.
-Верни ТОЛЬКО JSON:
-{{
-  "mode": "place" | "coordinates",
-  "query": "название места для поиска или пустая строка",
-  "lat": number | null,
-  "lon": number | null
-}}
-Правила:
-- Если пользователь назвал город, регион, страну, аэропорт или другое место — mode=place.
-- Если явно дал координаты — mode=coordinates и извлеки lat/lon.
-- Не придумывай координаты.
-- Удали фразы вроде «покажи погоду в» и оставь только название места.
-Запрос: {text}
-"""
-    response = groq_client.chat.completions.create(
-        model=GROQ_CHAT_MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": "Ты точный географический JSON parser."}, {"role": "user", "content": prompt}],
-    )
-    return json.loads(response.choices[0].message.content)
-
-def resolve_weather_query(text, lang="ru"):
-    parsed = parse_weather_location_query(text)
-    if parsed.get("mode") == "coordinates":
-        try:
-            lat = float(parsed.get("lat"))
-            lon = float(parsed.get("lon"))
-        except (TypeError, ValueError):
-            raise ValueError("Не удалось распознать координаты.")
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            raise ValueError("Координаты вне допустимого диапазона.")
-        places = reverse_geocode(lat, lon, 5)
-        if places:
-            loc = places[0]
-            label = location_label(loc)
-        else:
-            label = f"{lat:.4f}, {lon:.4f}"
-        return {"places": [{"name": label, "lat": lat, "lon": lon, "country": places[0].get("country", "") if places else ""}], "auto": True}
-
-    query = (parsed.get("query") or "").strip()
-    places = geocode_locations(query, 5)
-    return {
-        "places": [
-            {"name": location_label(loc), "city": loc.get("name", ""), "state": loc.get("state", ""), "country": loc.get("country", ""), "lat": loc.get("lat"), "lon": loc.get("lon")}
-            for loc in places
-        ],
-        "auto": len(places) == 1,
-    }
-
-def generate_image(prompt):
-    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
-        raise RuntimeError(
-            "Не настроены CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_API_TOKEN"
-        )
-
-    url = (
-        f"https://api.cloudflare.com/client/v4/accounts/"
-        f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_IMAGE_MODEL}"
-    )
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"prompt": prompt},
-        timeout=90,
-    )
-    response.raise_for_status()
-
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        payload = response.json()
-        result = payload.get("result", payload)
-        image_b64 = result.get("image") if isinstance(result, dict) else None
-        if not image_b64:
-            raise RuntimeError("Cloudflare не вернул изображение.")
-    else:
-        image_b64 = base64.b64encode(response.content).decode("ascii")
-
-    return f"data:image/png;base64,{image_b64}"
-
-def english_tts(text):
-    """Return a data URL for Groq TTS. Groq's documented voice is English."""
-    if not groq_client:
-        return None
-    try:
-        result = groq_client.audio.speech.create(
-            model=GROQ_TTS_MODEL,
-            voice=GROQ_TTS_VOICE,
-            input=text[:3000],
-            response_format="wav",
-        )
-        audio_bytes = result.read()
-        encoded = base64.b64encode(audio_bytes).decode("ascii")
-        return f"data:audio/wav;base64,{encoded}"
-    except Exception as exc:
-        print(f"TTS unavailable: {exc}")
-        return None
-
-def process_text(text, language_hint=None):
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("Пустой запрос.")
-
-    routed = route_request(text)
-    intent = routed.get("intent", "chat")
-    language = routed.get("language") or language_hint or "ru"
-
-    if intent == "weather":
-        city = (routed.get("city") or "").strip()
-        if not city:
-            answer = "Назови город, для которого проверить погоду."
-            return {"text": answer, "intent": intent, "audio": english_tts(answer) if language == "en" else None}
-        result = weather_response(city)
-        answer = result["text"]
-        return {
-            "text": answer,
-            "intent": intent,
-            "weather": result["data"],
-            "audio": english_tts(answer) if language == "en" else None,
-        }
-
-    if intent == "image":
-        prompt = (routed.get("image_prompt") or text).strip()
-        image = generate_image(prompt)
-        narration = (
-            "Я создал изображение по твоему описанию."
-            if language != "en"
-            else "I created the image from your description."
-        )
-        return {
-            "text": narration,
-            "intent": intent,
-            "image": image,
-            "audio": english_tts(narration) if language == "en" else None,
-        }
-
-    answer = chat_response(text)
-    return {
-        "text": answer,
-        "intent": "chat",
-        "audio": english_tts(answer) if language == "en" else None,
-    }
-
-def save_exchange(user_id, user_text, result):
-    if conversations is None:
-        return
-
-    timestamp = now()
-    message_user = {
-        "role": "user",
-        "content": user_text,
-        "created_at": timestamp,
-    }
-    message_assistant = {
-        "role": "assistant",
-        "content": result.get("text", ""),
-        "intent": result.get("intent", "chat"),
-        "image": result.get("image"),
-        "weather": result.get("weather"),
-        "created_at": timestamp,
-    }
-
-    conversations.update_one(
-        {"user_id": user_id},
-        {
-            "$push": {
-                "messages": {
-                    "$each": [message_user, message_assistant],
-                    "$slice": -100,
-                }
-            },
-            "$set": {"updated_at": timestamp},
-            "$setOnInsert": {"user_id": user_id, "created_at": timestamp},
-        },
-        upsert=True,
-    )
-
-# -----------------------------
-# Routes
-# -----------------------------
-@app.get("/")
-def index():
-    return send_from_directory(BASE_DIR, "index.html")
-
-@app.get("/app.js")
-def javascript():
-    return send_from_directory(BASE_DIR, "app.js", mimetype="application/javascript")
-
-@app.get("/style.css")
-def stylesheet():
-    return send_from_directory(BASE_DIR, "style.css", mimetype="text/css")
-
-@app.get("/weather")
-def weather_page():
-    return send_from_directory(BASE_DIR, "weather.html")
-
-@app.get("/api/weather/search")
-def weather_search():
-    query = (request.args.get("q") or "").strip()
-    if not query:
-        return jsonify({"places": []})
-    try:
-        if "," in query:
-            parts = [p.strip() for p in query.split(",")]
-            if len(parts) >= 2:
-                try:
-                    lat, lon = float(parts[0]), float(parts[1])
-                    if -90 <= lat <= 90 and -180 <= lon <= 180:
-                        places = reverse_geocode(lat, lon, 5)
-                        return jsonify({"places": [{"name": location_label(x), "city": x.get("name", ""), "state": x.get("state", ""), "country": x.get("country", ""), "lat": x.get("lat", lat), "lon": x.get("lon", lon)} for x in places] or [{"name": f"{lat:.5f}, {lon:.5f}", "lat": lat, "lon": lon, "country": ""}]})
-                except ValueError:
-                    pass
-        places = geocode_locations(query, 5)
-        return jsonify({"places": [{"name": location_label(x), "city": x.get("name", ""), "state": x.get("state", ""), "country": x.get("country", ""), "lat": x.get("lat"), "lon": x.get("lon")} for x in places]})
-    except Exception as exc:
-        print(f"/api/weather/search error: {exc}")
-        return jsonify({"error": str(exc)}), 500
-
-@app.get("/api/weather")
-def weather_api():
-    try:
-        lat = float(request.args.get("lat"))
-        lon = float(request.args.get("lon"))
-        lang = request.args.get("lang", "ru")
-
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            raise ValueError("Некорректные координаты.")
-
-        return jsonify(weather_bundle(lat, lon, lang))
-
-    except Exception as exc:
-        print(f"/api/weather error: {exc}")
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.post("/api/weather/ai")
-def weather_ai():
-    body = request.get_json(silent=True) or {}
-
-    text = (body.get("text") or "").strip()
-    lang = body.get("language") or "ru"
-
-    if not text:
-        return jsonify({"error": "Пустой запрос."}), 400
-
-    try:
-        result = resolve_weather_query(text, lang)
-
-        if result["auto"] and result["places"]:
-            p = result["places"][0]
-            result["weather"] = weather_bundle(
-                p["lat"],
-                p["lon"],
-                lang
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric", "lang": "ru"},
             )
-
-        return jsonify(result)
-
-    except Exception as exc:
-        print(f"/api/weather/ai error: {exc}")
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.post("/api/weather/voice")
-def weather_voice():
-    if "audio" not in request.files:
-        return jsonify({"error": "Аудиофайл не найден."}), 400
-
-    try:
-        require_service_config()
-
-        language_hint = request.form.get("language") or "ru"
-        audio = request.files["audio"]
-
-        transcription = groq_client.audio.transcriptions.create(
-            file=(
-                "weather.webm",
-                audio.read(),
-                "audio/webm"
-            ),
-            model=GROQ_STT_MODEL,
-            response_format="json",
-        )
-
-        text = (transcription.text or "").strip()
-
-        if not text:
-            return jsonify({
-                "error": "Не удалось распознать речь."
-            }), 400
-
-        result = resolve_weather_query(
-            text,
-            language_hint
-        )
-
-        if result["auto"] and result["places"]:
-            p = result["places"][0]
-
-            result["weather"] = weather_bundle(
-                p["lat"],
-                p["lon"],
-                language_hint
-            )
-
-        result["transcript"] = text
-
-        return jsonify(result)
-
-    except Exception as exc:
-        print(f"/api/weather/voice error: {exc}")
-        return jsonify({"error": str(exc)}), 500
+        if response.status_code != 200:
+            print("OpenWeather error:", response.status_code, response.text[:300])
+            raise HTTPException(502, "OpenWeather не смог получить погоду для этой точки")
+        data = response.json()
+        weather_item = (data.get("weather") or [{}])[0]
+        return {
+            "name": data.get("name") or "Точка на карте",
+            "lat": lat,
+            "lon": lon,
+            "temp": round(data.get("main", {}).get("temp", 0)),
+            "feels_like": round(data.get("main", {}).get("feels_like", 0)),
+            "description": weather_item.get("description", "неизвестно"),
+            "icon": weather_item.get("icon", "01d"),
+            "weather_id": weather_item.get("id", 800),
+            "humidity": data.get("main", {}).get("humidity"),
+            "wind": data.get("wind", {}).get("speed"),
+            "timezone": data.get("timezone", 0),
+            "sunrise": data.get("sys", {}).get("sunrise"),
+            "sunset": data.get("sys", {}).get("sunset"),
+            "observed_at": int(time.time()),
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(504, "OpenWeather не ответил вовремя")
 
 
-@app.get("/api/weather/saved")
-@auth_required
-def weather_saved(user_id):
-    if db is None:
-        return jsonify({"locations": []})
-
-    docs = list(
-        db["weather_locations"]
-        .find({"user_id": user_id})
-        .sort("created_at", ASCENDING)
-    )
-
-    return jsonify({
-        "locations": [
-            clean_doc(x)
-            for x in docs
-        ]
-    })
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return read_html("index.html")
 
 
-@app.post("/api/weather/saved")
-@auth_required
-def weather_saved_add(user_id):
-    if db is None:
-        return jsonify({
-            "error": "MongoDB недоступна."
-        }), 503
-
-    body = request.get_json(silent=True) or {}
-
-    try:
-        lat = float(body.get("lat"))
-        lon = float(body.get("lon"))
-
-    except (TypeError, ValueError):
-        return jsonify({
-            "error": "Некорректные координаты."
-        }), 400
-
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        return jsonify({
-            "error": "Некорректные координаты."
-        }), 400
-
-    doc = {
-        "user_id": user_id,
-        "name": (
-            body.get("name") or "Точка"
-        ).strip(),
-        "country": (
-            body.get("country") or ""
-        ).strip(),
-        "lat": lat,
-        "lon": lon,
-        "created_at": now(),
-    }
-
-    existing = db["weather_locations"].find_one({
-        "user_id": user_id,
-        "lat": lat,
-        "lon": lon
-    })
-
-    if existing:
-        db["weather_locations"].update_one(
-            {"_id": existing["_id"]},
-            {
-                "$set": {
-                    "name": doc["name"],
-                    "country": doc["country"]
-                }
-            }
-        )
-
-        doc["_id"] = existing["_id"]
-
-    else:
-        doc["_id"] = (
-            db["weather_locations"]
-            .insert_one(doc)
-            .inserted_id
-        )
-
-    return jsonify({
-        "location": clean_doc(doc)
-    })
+@app.get("/navigator", response_class=HTMLResponse)
+async def navigator():
+    return read_html("navigator.html")
 
 
-@app.delete("/api/weather/saved/<path:location_id>")
-@auth_required
-def weather_saved_delete(user_id, location_id):
-    if db is None:
-        return jsonify({
-            "error": "MongoDB недоступна."
-        }), 503
-
-    try:
-        from bson import ObjectId
-
-        result = db["weather_locations"].delete_one({
-            "_id": ObjectId(location_id),
-            "user_id": user_id
-        })
-
-        return jsonify({
-            "ok": result.deleted_count == 1
-        })
-
-    except Exception as exc:
-        return jsonify({
-            "error": str(exc)
-        }), 400
+@app.get("/travel-messanger", response_class=HTMLResponse)
+async def travel_messanger():
+    return read_html("travel-messanger.html")
 
 
 @app.get("/api/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "mongodb": bool(db is not None),
-        "groq": bool(GROQ_API_KEY),
-        "openweather": bool(OPENWEATHER_API_KEY),
-        "cloudflare": bool(
-            CLOUDFLARE_ACCOUNT_ID
-            and CLOUDFLARE_API_TOKEN
-        ),
-    })
+async def health():
+    return {
+        "status": "ok",
+        "openweather_configured": bool(OPENWEATHER_API_KEY),
+        "cloudflare_configured": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN),
+        "cloudflare_model": CLOUDFLARE_IMAGE_MODEL,
+        "navigator_available": (BASE_DIR / "navigator.html").exists(),
+        "travel_messanger_available": (BASE_DIR / "travel-messanger.html").exists(),
+        "travel_groq_configured": bool(TRAVEL_GROQ_API_KEY),
+        "travel_openweather_configured": bool(TRAVEL_OPENWEATHER_API_KEY),
+        "travel_cloudflare_configured": bool(TRAVEL_CLOUDFLARE_ACCOUNT_ID and TRAVEL_CLOUDFLARE_API_TOKEN),
+    }
 
 
-@app.post("/api/auth/register")
-def register():
-    if users is None:
-        return jsonify({
-            "error": "MongoDB не настроена или недоступна."
-        }), 503
-
-    body = request.get_json(silent=True) or {}
-
-    email = (
-        body.get("email") or ""
-    ).strip().lower()
-
-    password = body.get("password") or ""
-
-    if len(email) < 5 or "@" not in email:
-        return jsonify({
-            "error": "Укажи корректный email."
-        }), 400
-
-    if len(password) < 6:
-        return jsonify({
-            "error": "Пароль должен содержать минимум 6 символов."
-        }), 400
-
-    if users.find_one({"email": email}):
-        return jsonify({
-            "error": "Пользователь с таким email уже существует."
-        }), 409
-
-    password_hash = bcrypt.hashpw(
-        password.encode(),
-        bcrypt.gensalt()
-    ).decode()
-
-    result = users.insert_one({
-        "email": email,
-        "password_hash": password_hash,
-        "created_at": now(),
-    })
-
-    return jsonify({
-        "token": token_for_user(result.inserted_id),
-        "email": email,
-    }), 201
+# Existing weather API stays compatible with the home page and navigator.
+@app.get("/api/weather")
+async def weather(lat: float = Query(ge=-90, le=90), lon: float = Query(ge=-180, le=180)):
+    return await _get_weather(lat, lon, OPENWEATHER_API_KEY)
 
 
-@app.post("/api/auth/login")
-def login():
-    if users is None:
-        return jsonify({
-            "error": "MongoDB не настроена или недоступна."
-        }), 503
-
-    body = request.get_json(silent=True) or {}
-
-    email = (
-        body.get("email") or ""
-    ).strip().lower()
-
-    password = body.get("password") or ""
-
-    user = users.find_one({
-        "email": email
-    })
-
-    if not user or not bcrypt.checkpw(
-        password.encode(),
-        user["password_hash"].encode()
-    ):
-        return jsonify({
-            "error": "Неверный email или пароль."
-        }), 401
-
-    return jsonify({
-        "token": token_for_user(user["_id"]),
-        "email": email,
-    })
-
-
-@app.get("/api/conversation")
-@auth_required
-def get_conversation(user_id):
-    if conversations is None:
-        return jsonify({
-            "messages": []
-        })
-
-    doc = conversations.find_one({
-        "user_id": user_id
-    })
-
-    if not doc:
-        return jsonify({
-            "messages": []
-        })
-
-    return jsonify({
-        "messages": [
-            clean_doc(message)
-            for message in doc.get("messages", [])
-        ]
-    })
-
-
-@app.post("/api/text")
-@auth_required
-def text_endpoint(user_id):
-    body = request.get_json(silent=True) or {}
-
-    text = (
-        body.get("text") or ""
-    ).strip()
-
-    language = (
-        body.get("language") or "ru"
+# Existing Cloudflare sky API stays compatible with the home page and navigator.
+@app.post("/api/sky")
+async def generate_sky(request: SkyRequest):
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        raise HTTPException(503, "Добавьте CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_API_TOKEN в Render Environment")
+    period = request.period.lower()
+    if period not in {"dawn", "day", "dusk", "night", "morning", "evening"}:
+        period = "day"
+    cache_key = f"{round(request.lat, 1)}:{round(request.lon, 1)}:{request.weather.lower()}:{period}"
+    cached = _sky_cache.get(cache_key)
+    if cached and time.time() - cached[0] < 3600:
+        return {**cached[1], "cached": True}
+    prompt = (
+        "Create a beautiful photorealistic ultra-wide cinematic sky panorama above a real 3D map. "
+        f"Weather: {request.weather}. Local time of day: {period}. Coordinates: {request.lat:.3f}, {request.lon:.3f}. "
+        "Natural clouds, physically plausible lighting, realistic sky gradient and distant atmospheric horizon. "
+        "Only sky and distant atmospheric horizon: no foreground, buildings, mountains, people, text or logos. "
+        "Wide landscape composition, high realism."
     )
-
+    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_IMAGE_MODEL}"
     try:
-        result = process_text(
-            text,
-            language
-        )
-
-        save_exchange(
-            user_id,
-            text,
-            result
-        )
-
-        return jsonify(result)
-
-    except Exception as exc:
-        print(f"/api/text error: {exc}")
-
-        return jsonify({
-            "error": str(exc)
-        }), 500
-
-
-@app.post("/api/voice")
-@auth_required
-def voice_endpoint(user_id):
-    if "audio" not in request.files:
-        return jsonify({
-            "error": "Аудиофайл не найден."
-        }), 400
-
-    audio = request.files["audio"]
-
-    language_hint = (
-        request.form.get("language") or "ru"
-    )
-
-    try:
-        require_service_config()
-
-        transcription = (
-            groq_client.audio.transcriptions.create(
-                file=(
-                    "recording.webm",
-                    audio.read(),
-                    "audio/webm"
-                ),
-                model=GROQ_STT_MODEL,
-                response_format="json",
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
+                json={"prompt": prompt, "steps": 4},
             )
-        )
-
-        text = (
-            transcription.text or ""
-        ).strip()
-
-        if not text:
-            return jsonify({
-                "error": "Не удалось распознать речь."
-            }), 400
-
-        result = process_text(
-            text,
-            language_hint
-        )
-
-        result["transcript"] = text
-
-        save_exchange(
-            user_id,
-            text,
-            result
-        )
-
-        return jsonify(result)
-
+        if response.status_code != 200:
+            print("Cloudflare sky error:", response.status_code, response.text[:400])
+            raise HTTPException(502, f"Cloudflare не смог сгенерировать небо (HTTP {response.status_code})")
+        body = response.json()
+        image_data = (body.get("result") or {}).get("image")
+        if not image_data:
+            raise HTTPException(502, "Cloudflare вернул ответ без изображения")
+        payload = {"ok": True, "image": "data:image/jpeg;base64," + image_data, "model": CLOUDFLARE_IMAGE_MODEL, "cached": False}
+        _sky_cache[cache_key] = (time.time(), payload)
+        return payload
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Генерация неба заняла слишком много времени")
     except Exception as exc:
-        print(f"/api/voice error: {exc}")
-
-        return jsonify({
-            "error": str(exc)
-        }), 500
+        print("Cloudflare sky request failed:", repr(exc))
+        raise HTTPException(502, "Не удалось связаться с Cloudflare Workers AI")
 
 
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.getenv("PORT", "10000")
-        )
+@app.post("/api/travel/chat")
+async def travel_chat(request: TravelChatRequest):
+    if not TRAVEL_GROQ_API_KEY:
+        raise HTTPException(503, "Добавьте TRAVEL_GROQ_API_KEY в Render Environment")
+    system_prompt = """Ты — дружелюбный AI-проводник World Explorer. Отвечай по-русски, если пользователь пишет по-русски, иначе используй язык пользователя. Помогай исследовать места и объясняй, что можно увидеть.
+Если пользователь просит показать место, найти точку, открыть локацию или присылает координаты, обязательно добавляй в конце ответа отдельную строку строго в формате:
+[SHOW_LOCATION: название места]
+Для координат используй формат:
+[SHOW_COORDINATES: широта, долгота]
+Примеры: [SHOW_LOCATION: Eiffel Tower, Paris] или [SHOW_COORDINATES: 40.7128, -74.0060]
+Не создавай эти маркеры, если пользователь просто обсуждает место и не просит его открыть/показать. Если координаты уже указаны в сообщении — используй их. Никогда не выдумывай координаты. Не утверждай, что карта уже открыта, пока клиент не подтвердил это. Маркер должен быть последней строкой. Не используй markdown-код вокруг маркера."""
+    messages = [{"role": "system", "content": system_prompt}]
+    for item in request.history[-12:]:
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str):
+            messages.append({"role": role, "content": content[:3000]})
+    messages.append({"role": "user", "content": request.message})
+    try:
+        async with httpx.AsyncClient(timeout=35) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {TRAVEL_GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": TRAVEL_GROQ_MODEL, "messages": messages, "temperature": 0.4, "max_tokens": 700},
+            )
+        if response.status_code != 200:
+            print("Groq travel chat error:", response.status_code, response.text[:500])
+            if response.status_code in (401, 403):
+                raise HTTPException(502, "Groq отклонил ключ. Проверьте TRAVEL_GROQ_API_KEY.")
+            raise HTTPException(502, f"Groq не смог обработать запрос (HTTP {response.status_code})")
+        body = response.json()
+        answer = body["choices"][0]["message"]["content"].strip()
+        show_location = None
+        show_coordinates = None
+        loc_match = re.search(r"\[SHOW_LOCATION:\s*(.*?)\s*\]", answer, flags=re.I)
+        coord_match = re.search(r"\[SHOW_COORDINATES:\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]", answer, flags=re.I)
+        if loc_match:
+            show_location = loc_match.group(1).strip()[:180]
+            answer = answer[:loc_match.start()].rstrip()
+        if coord_match:
+            try:
+                lat, lon = float(coord_match.group(1)), float(coord_match.group(2))
+                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                    show_coordinates = {"lat": lat, "lon": lon}
+                    answer = answer[:coord_match.start()].rstrip()
+            except ValueError:
+                pass
+        # Safety fallback: recognize coordinate pairs directly from the user's message.
+        direct_coords = _parse_coordinates(request.message)
+        # A coordinate pair alone is a valid destination request in this travel chat.
+        if direct_coords and (re.fullmatch(r"\s*-?\d{1,2}(?:\.\d+)?\s*[,;]\s*-?\d{1,3}(?:\.\d+)?\s*", request.message) or any(
+            word in request.message.lower()
+            for word in ("покажи", "открой", "найди", "координат", "точка", "show", "open", "find", "map", "location")
+        )):
+            show_coordinates = {"lat": direct_coords[0], "lon": direct_coords[1]}
+            show_location = None
+        return {"reply": answer or "Конечно! Что хочешь исследовать?", "show_location": show_location, "show_coordinates": show_coordinates}
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(504, "ИИ-проводник долго отвечает. Попробуй ещё раз.")
+    except Exception as exc:
+        print("Groq travel chat request failed:", repr(exc))
+        raise HTTPException(502, "Не удалось связаться с Groq")
+
+
+@app.get("/api/travel/geocode")
+async def travel_geocode(q: str = Query(min_length=2, max_length=220)):
+    """Resolve a place name to coordinates using OpenStreetMap Nominatim."""
+    try:
+        async with httpx.AsyncClient(timeout=18, headers={"User-Agent": "WorldExplorerTravelMessenger/1.0 (location search)"}) as client:
+            response = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": q, "format": "jsonv2", "limit": 5, "addressdetails": 1},
+            )
+        if response.status_code != 200:
+            raise HTTPException(502, "Сервис поиска мест временно недоступен")
+        results = response.json()
+        return {
+            "results": [
+                {
+                    "name": item.get("display_name", q),
+                    "lat": float(item["lat"]),
+                    "lon": float(item["lon"]),
+                    "type": item.get("type"),
+                }
+                for item in results
+            ]
+        }
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Поиск места занял слишком много времени")
+    except Exception as exc:
+        print("Nominatim error:", repr(exc))
+        raise HTTPException(502, "Не удалось выполнить поиск места")
+
+
+@app.get("/api/travel/weather")
+async def travel_weather(lat: float = Query(ge=-90, le=90), lon: float = Query(ge=-180, le=180)):
+    data = await _get_weather(lat, lon, TRAVEL_OPENWEATHER_API_KEY)
+    data["period"] = _period_from_weather(data)
+    # Human-readable local time estimate based on OpenWeather's UTC offset.
+    local_epoch = int(time.time()) + int(data.get("timezone", 0) or 0)
+    data["local_time"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(local_epoch))
+    return data
+
+
+@app.post("/api/travel/sky")
+async def travel_generate_sky(request: TravelSkyRequest):
+    if not TRAVEL_CLOUDFLARE_ACCOUNT_ID or not TRAVEL_CLOUDFLARE_API_TOKEN:
+        raise HTTPException(503, "Добавьте TRAVEL_CLOUDFLARE_ACCOUNT_ID и TRAVEL_CLOUDFLARE_API_TOKEN в Render Environment")
+    period = request.period.lower()
+    if period not in {"dawn", "day", "dusk", "night", "morning", "evening"}:
+        period = "day"
+    cache_key = f"{round(request.lat, 1)}:{round(request.lon, 1)}:{request.weather.lower()}:{period}"
+    cached = _travel_sky_cache.get(cache_key)
+    if cached and time.time() - cached[0] < 3600:
+        return {**cached[1], "cached": True}
+    prompt = (
+        "Generate a breathtaking photorealistic wide cinematic sky and atmospheric horizon for a travel exploration map. "
+        f"Place: {request.place_name}. Coordinates: {request.lat:.4f}, {request.lon:.4f}. "
+        f"Real weather conditions: {request.weather}. Local time at this location: {request.local_time}; "
+        f"time-of-day mood: {period}. Reflect the weather accurately with plausible cloud cover, haze, light, "
+        "sun angle and sky colors. Beautiful natural realism, detailed clouds, atmospheric perspective, wide panorama. "
+        "Sky and distant horizon only; do not include foreground terrain, buildings, people, text or logos."
     )
+    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{TRAVEL_CLOUDFLARE_ACCOUNT_ID}/ai/run/{TRAVEL_CLOUDFLARE_IMAGE_MODEL}"
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {TRAVEL_CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
+                json={"prompt": prompt, "steps": 4},
+            )
+        if response.status_code != 200:
+            print("Travel Cloudflare error:", response.status_code, response.text[:500])
+            if response.status_code in (401, 403):
+                raise HTTPException(502, "Cloudflare отклонил travel-токен. Проверьте TRAVEL_CLOUDFLARE_API_TOKEN.")
+            raise HTTPException(502, f"Cloudflare не смог сгенерировать небо (HTTP {response.status_code})")
+        body = response.json()
+        image_data = (body.get("result") or {}).get("image")
+        if not image_data:
+            raise HTTPException(502, "Cloudflare вернул ответ без изображения")
+        payload = {"ok": True, "image": "data:image/jpeg;base64," + image_data, "model": TRAVEL_CLOUDFLARE_IMAGE_MODEL, "cached": False}
+        _travel_sky_cache[cache_key] = (time.time(), payload)
+        return payload
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Генерация неба заняла слишком много времени")
+    except Exception as exc:
+        print("Travel Cloudflare request failed:", repr(exc))
+        raise HTTPException(502, "Не удалось связаться с Cloudflare Workers AI")
+    
