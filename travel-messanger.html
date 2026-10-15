@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Travel Messenger · World Explorer</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--bg:#070b14;--panel:rgba(13,19,34,.88);--line:rgba(160,190,255,.16);--text:#edf3ff;--muted:#9caec9;--blue:#7c9cff;--cyan:#65e7ed;--pink:#ca9cff}
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+body{background:radial-gradient(ellipse at 50% -10%,#1b2850 0,transparent 55%),var(--bg)}
+.app{height:100dvh;display:grid;grid-template-columns:minmax(320px,410px) 1fr;gap:14px;padding:14px}
+.chat-panel{min-height:0;display:flex;flex-direction:column;border:1px solid var(--line);border-radius:25px;background:linear-gradient(160deg,rgba(19,27,49,.96),rgba(9,13,24,.96));box-shadow:0 24px 80px #0007;overflow:hidden;position:relative;z-index:2}
+.brand{display:flex;align-items:center;gap:12px;padding:18px 18px 14px;border-bottom:1px solid var(--line)}
+.brand-icon{width:42px;height:42px;border-radius:15px;background:linear-gradient(135deg,#8ca8ff,#7a6cff 55%,#64e9e9);display:grid;place-items:center;color:#10172c;font-size:21px;box-shadow:0 0 28px #758bff50}
+.brand h1{font-size:16px;letter-spacing:.2px;margin:0}.brand p{margin:4px 0 0;font-size:11px;color:var(--muted)}
+.status{margin-left:auto;display:flex;align-items:center;gap:6px;color:#92f5c3;font-size:10px;white-space:nowrap}.dot{width:6px;height:6px;border-radius:50%;background:#64e7a0;box-shadow:0 0 12px #64e7a0}
+.orb-stage{height:182px;flex:0 0 182px;position:relative;display:grid;place-items:center;overflow:hidden;background:radial-gradient(ellipse at center,#2739686b,transparent 65%)}
+#orbCanvas{width:165px;height:165px;cursor:pointer;filter:drop-shadow(0 0 25px #7893ff4f)}
+.orb-caption{position:absolute;bottom:8px;font-size:10px;letter-spacing:1.7px;color:#a9b9dd;text-transform:uppercase}
+.orb-ring{position:absolute;width:150px;height:150px;border:1px solid #93aaff26;border-radius:50%;pointer-events:none;animation:pulse 5s ease-in-out infinite}
+.orb-ring.r2{width:178px;height:178px;animation-delay:1.3s}
+@keyframes pulse{50%{transform:scale(1.08);opacity:.45}}
+.quick{display:flex;gap:7px;flex-wrap:wrap;padding:0 14px 12px}
+.chip{border:1px solid var(--line);background:#ffffff07;color:#c8d5f1;border-radius:99px;padding:7px 10px;font-size:11px;cursor:pointer}.chip:hover{background:#819cff1d;border-color:#7c9cff66}
+.messages{flex:1;min-height:0;overflow:auto;padding:8px 14px 16px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth}
+.msg{max-width:93%;padding:11px 13px;border-radius:16px;font-size:13px;line-height:1.52;white-space:pre-wrap;overflow-wrap:anywhere}
+.msg.ai{align-self:flex-start;background:linear-gradient(135deg,#202b48,#172038);border:1px solid #829bff1b;border-bottom-left-radius:5px}
+.msg.user{align-self:flex-end;background:linear-gradient(135deg,#526fda,#6e59c7);border-bottom-right-radius:5px;box-shadow:0 7px 20px #3f4ca433}
+.msg .tag{display:block;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:#9eafff;margin-bottom:4px}
+.composer{padding:12px;border-top:1px solid var(--line);background:#080d19a8}
+.search-row{display:flex;gap:7px;margin-bottom:8px}.search-row input,.input-row textarea{min-width:0;outline:none;color:var(--text);border:1px solid var(--line);background:#060b16;border-radius:13px;padding:11px 12px;font:inherit;font-size:12px}.search-row input{flex:1}.search-row input:focus,.input-row textarea:focus{border-color:#809aff99}
+.btn{border:1px solid var(--line);border-radius:12px;background:#202b48;color:var(--text);padding:0 13px;cursor:pointer;font-weight:650}.btn.primary{background:linear-gradient(135deg,#7b98ff,#7d70ed);border:0;color:#10162a}.btn:disabled{opacity:.45;cursor:wait}
+.input-row{display:flex;align-items:flex-end;gap:8px}.input-row textarea{resize:none;flex:1;height:45px;max-height:100px}.round-btn{width:44px;height:44px;flex:0 0 44px;border-radius:14px;font-size:17px;display:grid;place-items:center}
+.composer-note{font-size:9px;color:#7e8da9;padding:8px 3px 0}
+.visual{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(0,1fr) auto;gap:12px}
+.map-shell{min-height:0;position:relative;overflow:hidden;border:1px solid var(--line);border-radius:26px;background:#111a2c;box-shadow:0 24px 80px #0006}
+#map{position:absolute;inset:0}
+.sky-layer{position:absolute;inset:0 0 auto;height:34%;z-index:1;pointer-events:none;overflow:hidden;opacity:.87;mix-blend-mode:screen;mask-image:linear-gradient(to bottom,#000 0%,#0009 45%,transparent 100%)}
+.sky-layer img{width:100%;height:100%;object-fit:cover;display:none}
+.map-top{position:absolute;z-index:4;left:14px;right:14px;top:14px;display:flex;align-items:flex-start;gap:9px;pointer-events:none}
+.place-pill,.weather-pill{pointer-events:auto;background:rgba(8,13,26,.83);border:1px solid #b3c6ff26;backdrop-filter:blur(16px);border-radius:15px;padding:11px 13px;box-shadow:0 8px 28px #0003}
+.place-pill{flex:1;min-width:0}.place-pill .eyebrow{font-size:9px;text-transform:uppercase;letter-spacing:1.4px;color:#a6b7de}.place-pill strong{display:block;font-size:14px;margin-top:4px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}.place-pill small{display:block;color:var(--muted);font-size:10px;margin-top:3px}
+.weather-pill{text-align:right;min-width:110px}.weather-pill b{font-size:18px}.weather-pill span{display:block;font-size:10px;color:#c4d0e8;margin-top:2px}
+.map-actions{position:absolute;z-index:4;right:14px;bottom:14px;display:flex;flex-direction:column;gap:8px}
+.map-actions button{background:rgba(8,13,26,.85);border:1px solid #b3c6ff30;color:#edf3ff;border-radius:13px;padding:10px 12px;backdrop-filter:blur(12px);cursor:pointer}
+.map-crosshair{position:absolute;z-index:3;left:50%;top:50%;transform:translate(-50%,-50%);pointer-events:none;font-size:22px;color:#d6e6ff;text-shadow:0 2px 10px #000;opacity:.8}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.metric{padding:13px 15px;border-radius:17px;background:var(--panel);border:1px solid var(--line);min-width:0}
+.metric span{display:block;font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}.metric strong{display:block;font-size:16px;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metric small{display:block;font-size:10px;color:#8393b0;margin-top:3px}
+.toast{position:absolute;z-index:10;left:50%;bottom:22px;transform:translateX(-50%);background:#121c32;border:1px solid #a4b8ff3b;border-radius:13px;padding:11px 15px;font-size:12px;box-shadow:0 10px 40px #0008;max-width:90%;display:none}
+.loading{position:absolute;inset:0;z-index:8;display:none;place-items:center;background:#05091480;backdrop-filter:blur(3px);font-size:12px;color:#dbe5ff}
+@media(max-width:850px){.app{grid-template-columns:1fr;grid-template-rows:minmax(340px,46dvh) minmax(0,1fr);gap:10px;padding:8px}.chat-panel{grid-row:2;border-radius:21px}.orb-stage{height:96px;flex-basis:96px}.orb-ring{width:85px;height:85px}.orb-ring.r2{width:104px;height:104px}#orbCanvas{width:95px;height:95px}.orb-caption{display:none}.brand{padding:10px 14px}.brand-icon{width:35px;height:35px}.quick{padding-bottom:6px}.messages{padding-top:2px}.visual{grid-row:1;grid-template-rows:minmax(0,1fr) auto;gap:7px}.map-shell{border-radius:20px}.metrics{gap:6px}.metric{padding:9px}.metric strong{font-size:13px}.metric small{font-size:9px}.weather-pill{min-width:88px}.weather-pill b{font-size:15px}.map-top{left:8px;right:8px;top:8px}.place-pill,.weather-pill{padding:9px}.place-pill strong{font-size:12px}.map-actions{right:8px;bottom:8px}.map-actions button{padding:8px 10px}}
+@media(max-width:420px){.app{grid-template-rows:minmax(300px,42dvh) minmax(0,1fr)}.status{display:none}.msg{font-size:12px}.quick .chip{padding:6px 8px}.metric span{letter-spacing:.5px;font-size:8px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <section class="chat-panel">
+    <header class="brand">
+      <div class="brand-icon">✦</div>
+      <div><h1>Travel Messenger</h1><p>Твой ИИ-проводник по миру</p></div>
+      <div class="status"><i class="dot"></i><span id="statusText">READY TO EXPLORE</span></div>
+    </header>
+    <div class="orb-stage" id="orbStage">
+      <div class="orb-ring"></div><div class="orb-ring r2"></div>
+      <canvas id="orbCanvas" aria-label="Нажми, чтобы начать голосовой ввод"></canvas>
+      <div class="orb-caption" id="orbCaption">TAP THE ORB TO SPEAK</div>
+    </div>
+    <div class="quick">
+      <button class="chip" data-prompt="Покажи Эйфелеву башню в Париже">🗼 Эйфелева башня</button>
+      <button class="chip" data-prompt="Покажи координаты 40.7128, -74.0060">📍 Координаты</button>
+      <button class="chip" data-prompt="Какая сейчас погода в Токио?">🌦️ Погода</button>
+    </div>
+    <div class="messages" id="messages">
+      <div class="msg ai"><span class="tag">WORLD EXPLORER AI</span>Привет! Я твой ИИ-проводник. Назови место, напиши адрес или координаты — и я открою его на карте с рельефом, местной погодой и небом, созданным ИИ.</div>
+    </div>
+    <div class="composer">
+      <form class="search-row" id="searchForm">
+        <input id="placeSearch" autocomplete="off" placeholder="Найти место или 48.8584, 2.2945">
+        <button class="btn" type="submit">Найти</button>
+      </form>
+      <form class="input-row" id="chatForm">
+        <textarea id="chatInput" rows="1" placeholder="Напиши, что хочешь увидеть…"></textarea>
+        <button class="btn round-btn" id="micBtn" type="button" title="Голосовой ввод">🎙️</button>
+        <button class="btn primary round-btn" id="sendBtn" type="submit" title="Отправить">➤</button>
+      </form>
+      <div class="composer-note">Поиск места и геолокация используют внешние сервисы. Для голоса нужен доступ к микрофону.</div>
+    </div>
+  </section>
+
+  <section class="visual">
+    <div class="map-shell">
+      <div id="map"></div>
+      <div class="sky-layer"><img id="skyImage" alt="AI generated sky"></div>
+      <div class="map-top">
+        <div class="place-pill"><span class="eyebrow">EXPLORING NOW</span><strong id="placeTitle">Выбери точку на Земле</strong><small id="coordsText">Ожидание точки назначения</small></div>
+        <div class="weather-pill"><b id="tempText">—°</b><span id="weatherText">Погода загрузится</span><span id="localTimeText">--:-- local</span></div>
+      </div>
+      <div class="map-crosshair">＋</div>
+      <div class="map-actions">
+        <button id="myLocationBtn">◎ Моё место</button>
+        <button id="terrainBtn">⛰ Рельеф: вкл.</button>
+        <button id="skyBtn">✧ Обновить небо</button>
+      </div>
+      <div class="loading" id="mapLoading">Исследуем эту точку…</div>
+      <div class="toast" id="toast"></div>
+    </div>
+    <div class="metrics">
+      <div class="metric"><span>Координаты</span><strong id="metricCoords">—</strong><small>Широта / долгота</small></div>
+      <div class="metric"><span>Местное время</span><strong id="metricTime">—</strong><small>По часовому поясу точки</small></div>
+      <div class="metric"><span>Погодные условия</span><strong id="metricWeather">—</strong><small id="metricWind">Ожидание данных</small></div>
+    </div>
+  </section>
+</div>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const messages = $('messages');
+  let map, terrainEnabled = true, currentPoint = null, currentWeather = null, recognition = null, isListening = false;
+  let history = [], skyBusy = false, chatBusy = false, toastTimer = null;
+
+  function toast(text) {
+    const el = $('toast'); el.textContent = text; el.style.display = 'block';
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.style.display = 'none', 4200);
+  }
+  function setStatus(text) { $('statusText').textContent = text; }
+  function addMessage(role, text) {
+    const div = document.createElement('div'); div.className = 'msg ' + role;
+    if (role === 'ai') {
+      const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = 'WORLD EXPLORER AI'; div.appendChild(tag);
+    }
+    div.appendChild(document.createTextNode(text));
+    messages.appendChild(div); messages.scrollTop = messages.scrollHeight;
+    return div;
+  }
+  async function api(url, options) {
+    const response = await fetch(url, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || `Ошибка запроса: ${response.status}`);
+    return data;
+  }
+  function parseCoords(text) {
+    const m = text.trim().match(/^(-?\d{1,2}(?:\.\d+)?)\s*[,;]\s*(-?\d{1,3}(?:\.\d+)?)$/);
+    if (!m) return null;
+    const lat = Number(m[1]), lon = Number(m[2]);
+    return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 ? {lat, lon} : null;
+  }
+  function initMap() {
+    map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://tiles.openfreemap.org/styles/liberty',
+      center: [0, 20], zoom: 2.2, pitch: 55, bearing: -10,
+      attributionControl: true
+    });
+    map.addControl(new maplibregl.NavigationControl({visualizePitch:true}), 'bottom-left');
+    map.on('load', () => {
+      try {
+        map.addSource('terrain-dem', {type:'raster-dem', tiles:['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'], tileSize:256, encoding:'terrarium', maxzoom:15});
+        map.setTerrain({source:'terrain-dem', exaggeration:1.25});
+        map.addLayer({id:'hillshade', type:'hillshade', source:'terrain-dem', paint:{'hillshade-exaggeration':0.55}}, map.getStyle().layers.find(l=>l.type==='symbol')?.id);
+      } catch (e) { console.warn('Terrain setup:', e); }
+    });
+    map.on('click', e => showPoint(e.lngLat.lat, e.lngLat.lng, `${e.lngLat.lat.toFixed(4)}, ${e.lngLat.lng.toFixed(4)}`));
+  }
+  async function geocode(q) {
+    const c = parseCoords(q);
+    if (c) return {lat:c.lat, lon:c.lon, name:`${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}`};
+    const data = await api('/api/travel/geocode?q=' + encodeURIComponent(q));
+    if (!data.results || !data.results.length) throw new Error('Не удалось найти это место. Попробуй уточнить название или ввести координаты.');
+    return data.results[0];
+  }
+  function flyTo(lat, lon, zoom=15) {
+    if (!map) return;
+    map.flyTo({center:[lon,lat], zoom, pitch:62, bearing:map.getBearing(), speed:0.8, curve:1.35, essential:true});
+  }
+  async function showPoint(lat, lon, name='Выбранная точка') {
+    currentPoint = {lat, lon, name};
+    $('mapLoading').style.display = 'grid'; setStatus('LOADING LOCATION');
+    $('placeTitle').textContent = name;
+    $('coordsText').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    $('metricCoords').textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+    $('skyImage').style.display = 'none';
+    flyTo(lat, lon, 15);
+    try {
+      const weather = await api(`/api/travel/weather?lat=${lat}&lon=${lon}`);
+      currentWeather = weather;
+      $('tempText').textContent = `${weather.temp}°C`;
+      $('weatherText').textContent = weather.description;
+      $('localTimeText').textContent = weather.local_time + ' local';
+      $('metricTime').textContent = weather.local_time;
+      $('metricWeather').textContent = `${weather.temp}° · ${weather.description}`;
+      $('metricWind').textContent = `Ветер ${weather.wind ?? '—'} м/с · влажность ${weather.humidity ?? '—'}%`;
+      if (!name || name === 'Выбранная точка' || /^-?\d/.test(name)) {
+        if (weather.name && weather.name !== 'Точка на карте') $('placeTitle').textContent = weather.name;
+      }
+      addMessage('ai', `Открыл точку: ${$('placeTitle').textContent}.\nПогода: ${weather.description}, ${weather.temp}°C. Местное время: ${weather.local_time}.`);
+      generateSky(weather).catch(err => { console.warn(err); toast('Погода загружена, но небо ИИ пока недоступно: ' + err.message); });
+    } catch (err) {
+      $('tempText').textContent = '—°'; $('weatherText').textContent = 'Погода недоступна';
+      toast(err.message);
+    } finally {
+      $('mapLoading').style.display = 'none'; setStatus('READY TO EXPLORE');
+    }
+  }
+  async function generateSky(weather=currentWeather) {
+    if (!currentPoint || !weather || skyBusy) return;
+    skyBusy = true; $('skyBtn').disabled = true;
+    try {
+      const data = await api('/api/travel/sky', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        lat:currentPoint.lat, lon:currentPoint.lon, weather:weather.description,
+        period:weather.period || 'day', local_time:weather.local_time || 'unknown',
+        place_name:$('placeTitle').textContent
+      })});
+      $('skyImage').src = data.image; $('skyImage').style.display = 'block';
+    } finally { skyBusy = false; $('skyBtn').disabled = false; }
+  }
+  async function doSearch(query) {
+    if (!query.trim()) return;
+    try {
+      setStatus('SEARCHING');
+      const point = await geocode(query);
+      await showPoint(point.lat, point.lon, point.name || query);
+    } catch (err) { toast(err.message); }
+    finally { setStatus('READY TO EXPLORE'); }
+  }
+  async function sendChat(text) {
+    text = (text || '').trim(); if (!text || chatBusy) return;
+    chatBusy = true; $('sendBtn').disabled = true;
+    addMessage('user', text);
+    history.push({role:'user', content:text});
+    $('chatInput').value = ''; $('chatInput').style.height = '45px'; setStatus('THINKING');
+    const pending = addMessage('ai', 'Думаю…');
+    try {
+      const data = await api('/api/travel/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text, history:history.slice(-12,-1)})});
+      pending.remove();
+      addMessage('ai', data.reply || 'Давай исследуем мир!');
+      history.push({role:'assistant', content:data.reply || ''});
+      if (data.show_coordinates) {
+        await showPoint(data.show_coordinates.lat, data.show_coordinates.lon, `${data.show_coordinates.lat.toFixed(5)}, ${data.show_coordinates.lon.toFixed(5)}`);
+      } else if (data.show_location) {
+        await doSearch(data.show_location);
+      } else if (/\b(покажи|открой|найди|show|open|find)\b/i.test(text)) {
+        const coords = parseCoords(text);
+        if (coords) await showPoint(coords.lat, coords.lon, `${coords.lat.toFixed(5)}, ${coords.lon.toFixed(5)}`);
+      }
+    } catch (err) { pending.remove(); addMessage('ai', 'Не получилось обработать запрос: ' + err.message); }
+    finally { chatBusy = false; $('sendBtn').disabled = false; setStatus('READY TO EXPLORE'); }
+  }
+
+  $('searchForm').addEventListener('submit', e => {e.preventDefault(); const q=$('placeSearch').value.trim(); if(q) {addMessage('user','Покажи на карте: '+q); doSearch(q);}});
+  $('chatForm').addEventListener('submit', e => {e.preventDefault(); sendChat($('chatInput').value);});
+  $('chatInput').addEventListener('input', e => {e.target.style.height='45px';e.target.style.height=Math.min(e.target.scrollHeight,100)+'px';});
+  $('chatInput').addEventListener('keydown', e => {if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('chatForm').requestSubmit();}});
+  document.querySelectorAll('[data-prompt]').forEach(b => b.addEventListener('click',()=>sendChat(b.dataset.prompt)));
+  $('myLocationBtn').addEventListener('click', () => {
+    if (!navigator.geolocation) return toast('Этот браузер не поддерживает геолокацию.');
+    setStatus('LOCATING');
+    navigator.geolocation.getCurrentPosition(pos => {
+      showPoint(pos.coords.latitude,pos.coords.longitude,'Моё местоположение');
+    }, err => toast('Не удалось получить местоположение: ' + err.message), {enableHighAccuracy:true, timeout:15000, maximumAge:10000});
+  });
+  $('terrainBtn').addEventListener('click', () => {
+    terrainEnabled = !terrainEnabled;
+    try { if(terrainEnabled) map.setTerrain({source:'terrain-dem',exaggeration:1.25}); else map.setTerrain(null); } catch(e){}
+    $('terrainBtn').textContent = terrainEnabled ? '⛰ Рельеф: вкл.' : '⛰ Рельеф: выкл.';
+  });
+  $('skyBtn').addEventListener('click', () => generateSky().catch(err=>toast(err.message)));
+
+  // Three.js animated luminous AI orb.
+  function initOrb() {
+    const canvas = $('orbCanvas');
+    if (!window.THREE) { canvas.style.display='none'; return; }
+    const renderer = new THREE.WebGLRenderer({canvas, alpha:true, antialias:true});
+    renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(35,1,0.1,100); camera.position.z=5;
+    const group = new THREE.Group(); scene.add(group);
+    const geo = new THREE.IcosahedronGeometry(1.18,5);
+    const mat = new THREE.MeshStandardMaterial({color:0x6b8fff, metalness:.5, roughness:.22, emissive:0x253b9e, emissiveIntensity:.6, wireframe:false});
+    const orb = new THREE.Mesh(geo,mat); group.add(orb);
+    const wire = new THREE.Mesh(new THREE.IcosahedronGeometry(1.23,2), new THREE.MeshBasicMaterial({color:0x99e8ff,wireframe:true,transparent:true,opacity:.16})); group.add(wire);
+    const ringMat = new THREE.MeshBasicMaterial({color:0x7d9bff,transparent:true,opacity:.65});
+    const ring1 = new THREE.Mesh(new THREE.TorusGeometry(1.45,.012,8,120),ringMat); ring1.rotation.x=1.1; group.add(ring1);
+    const ring2 = new THREE.Mesh(new THREE.TorusGeometry(1.58,.008,8,120),new THREE.MeshBasicMaterial({color:0x74e9ed,transparent:true,opacity:.38})); ring2.rotation.y=1.1; group.add(ring2);
+    scene.add(new THREE.HemisphereLight(0xaecbff,0x151c56,1.6));
+    const light = new THREE.PointLight(0x8aa6ff,3,10); light.position.set(2,2,3); scene.add(light);
+    function resize(){const r=canvas.getBoundingClientRect();renderer.setSize(Math.max(1,r.width),Math.max(1,r.height),false);camera.aspect=r.width/Math.max(1,r.height);camera.updateProjectionMatrix();}
+    new ResizeObserver(resize).observe(canvas); resize();
+    function animate(t){requestAnimationFrame(animate);const s=isListening?1.07+Math.sin(t*.025)*.06:1+Math.sin(t*.0014)*.018;group.scale.setScalar(s);orb.rotation.y=t*.00022;orb.rotation.x=Math.sin(t*.0005)*.12;wire.rotation.y=-t*.00012;ring1.rotation.z=t*.00025;ring2.rotation.x=1.1+Math.sin(t*.0004)*.15;renderer.render(scene,camera);}
+    animate(0);
+    canvas.addEventListener('click', toggleVoice);
+  }
+  function toggleVoice() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return toast('Голосовой ввод не поддерживается в этом браузере. Попробуй Chrome.');
+    if (isListening && recognition) {recognition.stop();return;}
+    recognition = new SpeechRecognition(); recognition.lang = 'ru-RU'; recognition.interimResults = true; recognition.continuous = false;
+    let finalText = '';
+    recognition.onstart = () => {isListening=true;$('orbCaption').textContent='LISTENING… TAP TO STOP';$('micBtn').textContent='⏹';setStatus('LISTENING');};
+    recognition.onresult = event => {let interim='';for(let i=event.resultIndex;i<event.results.length;i++){const t=event.results[i][0].transcript;if(event.results[i].isFinal)finalText+=t;else interim+=t;}$('chatInput').value=(finalText+' '+interim).trim();};
+    recognition.onerror = event => toast('Ошибка микрофона: '+event.error);
+    recognition.onend = () => {isListening=false;$('orbCaption').textContent='TAP THE ORB TO SPEAK';$('micBtn').textContent='🎙️';setStatus('READY TO EXPLORE');const text=$('chatInput').value.trim();if(text)sendChat(text);};
+    recognition.start();
+  }
+  $('micBtn').addEventListener('click',toggleVoice);
+  initMap(); initOrb();
+})();
+</script>
+</body>
+</html>
